@@ -644,25 +644,57 @@ class LiveTrader:
 
     def _cancel_and_switch_to_sell(self, ask_price: float):
         """Cancel buy order and switch to sell side."""
-        try:
-            trading.cancel_order(self.active_buy_order_id)
-            self._log("Switching: canceled buy, submitting sell")
-        except Exception:
-            pass
+        order_id = self.active_buy_order_id
         self.active_buy_order_id = None
         self.active_buy_price = 0.0
-        self._submit_limit_sell(ask_price)
+
+        try:
+            trading.cancel_order(order_id)
+            self._log("Switching: canceling buy...")
+
+            # Wait for cancel to complete (poll up to 1 second)
+            for _ in range(10):
+                time.sleep(0.1)
+                try:
+                    order = trading.get_order(order_id)
+                    if order.status.value in ["canceled", "filled", "expired"]:
+                        break
+                except Exception:
+                    break  # Order may not exist anymore
+
+            self._log("Buy canceled, submitting sell")
+            self._submit_limit_sell(ask_price)
+
+        except Exception as e:
+            self._log(f"Error canceling buy: {e}")
+            # Still try to submit sell on next iteration
 
     def _cancel_and_switch_to_buy(self, bid_price: float):
         """Cancel sell order and switch to buy side."""
-        try:
-            trading.cancel_order(self.active_sell_order_id)
-            self._log("Switching: canceled sell, submitting buy")
-        except Exception:
-            pass
+        order_id = self.active_sell_order_id
         self.active_sell_order_id = None
         self.active_sell_price = 0.0
-        self._submit_limit_buy(bid_price)
+
+        try:
+            trading.cancel_order(order_id)
+            self._log("Switching: canceling sell...")
+
+            # Wait for cancel to complete (poll up to 1 second)
+            for _ in range(10):
+                time.sleep(0.1)
+                try:
+                    order = trading.get_order(order_id)
+                    if order.status.value in ["canceled", "filled", "expired"]:
+                        break
+                except Exception:
+                    break  # Order may not exist anymore
+
+            self._log("Sell canceled, submitting buy")
+            self._submit_limit_buy(bid_price)
+
+        except Exception as e:
+            self._log(f"Error canceling sell: {e}")
+            # Still try to submit buy on next iteration
 
     def _submit_limit_buy(self, price: float):
         """Submit a limit buy order."""
