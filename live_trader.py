@@ -652,22 +652,35 @@ class LiveTrader:
             trading.cancel_order(order_id)
             self._log("Switching: canceling buy...")
 
-            # Wait for cancel to complete (poll up to 1 second)
-            for _ in range(10):
+            # Wait for cancel to complete (poll up to 3 seconds)
+            canceled = False
+            for _ in range(30):
                 time.sleep(0.1)
                 try:
                     order = trading.get_order(order_id)
-                    if order.status.value in ["canceled", "filled", "expired"]:
+                    status = order.status.value
+                    if status in ["canceled", "expired"]:
+                        canceled = True
                         break
+                    elif status == "filled":
+                        # Order filled while we were canceling - handle the fill
+                        self._log("Buy filled during cancel!")
+                        fill_price = float(order.filled_avg_price)
+                        self._handle_buy_fill(fill_price)
+                        return  # Don't switch, we just got filled
                 except Exception:
-                    break  # Order may not exist anymore
+                    canceled = True  # Order may not exist anymore
+                    break
 
-            self._log("Buy canceled, submitting sell")
-            self._submit_limit_sell(ask_price)
+            if canceled:
+                self._log("Buy canceled, submitting sell")
+                self._submit_limit_sell(ask_price)
+            else:
+                self._log("Warning: Cancel may not have completed")
+                # Don't submit sell - wait for next iteration
 
         except Exception as e:
             self._log(f"Error canceling buy: {e}")
-            # Still try to submit sell on next iteration
 
     def _cancel_and_switch_to_buy(self, bid_price: float):
         """Cancel sell order and switch to buy side."""
@@ -679,22 +692,35 @@ class LiveTrader:
             trading.cancel_order(order_id)
             self._log("Switching: canceling sell...")
 
-            # Wait for cancel to complete (poll up to 1 second)
-            for _ in range(10):
+            # Wait for cancel to complete (poll up to 3 seconds)
+            canceled = False
+            for _ in range(30):
                 time.sleep(0.1)
                 try:
                     order = trading.get_order(order_id)
-                    if order.status.value in ["canceled", "filled", "expired"]:
+                    status = order.status.value
+                    if status in ["canceled", "expired"]:
+                        canceled = True
                         break
+                    elif status == "filled":
+                        # Order filled while we were canceling - handle the fill
+                        self._log("Sell filled during cancel!")
+                        fill_price = float(order.filled_avg_price)
+                        self._handle_sell_fill(fill_price)
+                        return  # Don't switch, we just got filled
                 except Exception:
-                    break  # Order may not exist anymore
+                    canceled = True  # Order may not exist anymore
+                    break
 
-            self._log("Sell canceled, submitting buy")
-            self._submit_limit_buy(bid_price)
+            if canceled:
+                self._log("Sell canceled, submitting buy")
+                self._submit_limit_buy(bid_price)
+            else:
+                self._log("Warning: Cancel may not have completed")
+                # Don't submit buy - wait for next iteration
 
         except Exception as e:
             self._log(f"Error canceling sell: {e}")
-            # Still try to submit buy on next iteration
 
     def _submit_limit_buy(self, price: float):
         """Submit a limit buy order."""
