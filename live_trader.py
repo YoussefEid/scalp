@@ -464,12 +464,7 @@ class LiveTrader:
     def _submit_resting_orders(self):
         """Submit limit orders at current bid/ask levels.
 
-        Alpaca restriction: Cannot have simultaneous buy and sell orders when position = 0.
-        - If position == 0: Submit ONE order based on price vs zero point
-          - Price below zero → BUY (expecting bounce up)
-          - Price above zero → SELL (expecting drop down)
-        - If position > 0: Can submit both BUY and SELL
-        - If position < 0: Can submit both BUY and SELL
+        Submit both BUY and SELL orders to capture whichever direction price moves.
         """
         if not self.trading_active or not self.strategy:
             return
@@ -485,39 +480,15 @@ class LiveTrader:
         with self.order_lock:
             bid, ask = self.strategy.state.get_quotes()
             position = self.strategy.state.position
-            zero_point = self.strategy.state.zero_point
 
             # Round prices to 2 decimal places
             bid_price = round(bid.price, 2)
             ask_price = round(ask.price, 2)
 
-            # Get current market price to decide entry direction
-            try:
-                quote = market_data.get_latest_quote(self.ticker)
-                current_price = (float(quote.ask_price) + float(quote.bid_price)) / 2
-            except:
-                current_price = zero_point
-
-            # Determine which orders we can submit based on position
-            if position == 0:
-                # No position: can only have ONE order open
-                # Decide direction based on price vs zero point
-                if current_price <= zero_point:
-                    can_buy = True
-                    can_sell = False
-                    self._log(f"Position: 0 | Price ${current_price:.2f} <= Zero ${zero_point:.2f} | BUY @ ${bid_price:.2f}")
-                else:
-                    can_buy = False
-                    can_sell = True
-                    self._log(f"Position: 0 | Price ${current_price:.2f} > Zero ${zero_point:.2f} | SELL @ ${ask_price:.2f}")
-            else:
-                # Have position: can submit both orders
-                can_buy = True
-                can_sell = True
-                self._log(f"Position: {position} | BUY @ ${bid_price:.2f} | SELL @ ${ask_price:.2f}")
+            self._log(f"Position: {position} | BUY @ ${bid_price:.2f} | SELL @ ${ask_price:.2f}")
 
             # Submit buy limit order
-            if can_buy and not self.active_buy_order_id:
+            if not self.active_buy_order_id:
                 try:
                     order = trading.place_limit_order(
                         self.ticker,
@@ -533,7 +504,7 @@ class LiveTrader:
                     self._log(f"Error submitting buy order: {e}")
 
             # Submit sell limit order
-            if can_sell and not self.active_sell_order_id:
+            if not self.active_sell_order_id:
                 try:
                     order = trading.place_limit_order(
                         self.ticker,
