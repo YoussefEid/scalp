@@ -462,7 +462,13 @@ class LiveTrader:
                 self._log(f"Error canceling sell order: {e}")
 
     def _submit_resting_orders(self):
-        """Submit limit orders at current bid/ask levels."""
+        """Submit limit orders at current bid/ask levels.
+
+        Alpaca restriction: Cannot have simultaneous buy and sell orders without position.
+        - If position == 0: Only submit buy order (to enter long)
+        - If position > 0: Submit sell order to exit, and buy order to add
+        - If position < 0: Submit buy order to cover, and sell order to add
+        """
         if not self.trading_active or not self.strategy:
             return
 
@@ -476,15 +482,23 @@ class LiveTrader:
 
         with self.order_lock:
             bid, ask = self.strategy.state.get_quotes()
+            position = self.strategy.state.position
 
             # Round prices to 2 decimal places
             bid_price = round(bid.price, 2)
             ask_price = round(ask.price, 2)
 
-            self._log(f"Submitting orders: BUY @ ${bid_price:.2f} | SELL @ ${ask_price:.2f}")
+            # Determine which orders we can submit based on position
+            can_buy = True
+            can_sell = position > 0  # Can only sell if we have shares
+
+            if position == 0:
+                self._log(f"Position: 0 | Submitting BUY @ ${bid_price:.2f} (waiting for entry)")
+            else:
+                self._log(f"Position: {position} | BUY @ ${bid_price:.2f} | SELL @ ${ask_price:.2f}")
 
             # Submit buy limit order
-            if not self.active_buy_order_id:
+            if can_buy and not self.active_buy_order_id:
                 try:
                     order = trading.place_limit_order(
                         self.ticker,
@@ -499,12 +513,14 @@ class LiveTrader:
                 except Exception as e:
                     self._log(f"Error submitting buy order: {e}")
 
-            # Submit sell limit order
-            if not self.active_sell_order_id:
+            # Submit sell limit order (only if we have position)
+            if can_sell and not self.active_sell_order_id:
                 try:
+                    # Sell quantity is min of trade_size and current position
+                    sell_qty = min(self.trade_size, position)
                     order = trading.place_limit_order(
                         self.ticker,
-                        self.trade_size,
+                        sell_qty,
                         OrderSide.SELL,
                         ask_price,
                         TimeInForce.DAY,
