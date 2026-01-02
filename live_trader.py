@@ -202,6 +202,11 @@ class LiveTrader:
             median_range = bars_reset["range_pct"].median()
             self._log(f"Median bar range: {median_range:.4f}%")
 
+            # If median range is 0 or very small (IEX data can be sparse), use default
+            if median_range < 0.01:
+                self._log("Warning: Median range too small (sparse IEX data), using default 0.4%")
+                return 0.4
+
             quote_width = median_range * self.multiplier
             self._log(f"Quote width (with {self.multiplier}x multiplier): {quote_width:.4f}%")
 
