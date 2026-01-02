@@ -482,14 +482,13 @@ class LiveTrader:
                 self._log(f"Error canceling sell order: {e}")
 
     def _check_and_execute(self):
-        """Manage limit orders - submit one at a time and check for fills.
+        """Manage limit orders with quick switching based on price direction.
 
         Strategy:
-        1. Only one limit order active at a time (avoids Alpaca's restriction)
-        2. Submit order on the side closer to current market price
-        3. Check for fills and retreat levels when filled
-        4. Cancel and resubmit if price moves away significantly
-        5. Only submit non-marketable limit orders (won't fill immediately)
+        1. Only one limit order active at a time (Alpaca restriction)
+        2. Track price direction - if price moves toward opposite level, switch sides
+        3. Submit the side that price is moving TOWARD (likely to fill)
+        4. Quick cancel and switch when price reverses direction
         """
         if not self.trading_active or not self.strategy:
             return
@@ -519,39 +518,151 @@ class LiveTrader:
                 self._log(f"Error getting quote: {e}")
                 return
 
-            # Check if we have an active order
-            if self.active_buy_order_id:
-                self._check_buy_order_status(bid_price)
-            elif self.active_sell_order_id:
-                self._check_sell_order_status(ask_price)
+            # Track price direction
+            if not hasattr(self, '_last_mid_price'):
+                self._last_mid_price = current_mid
+
+            price_moving_down = current_mid < self._last_mid_price
+            price_moving_up = current_mid > self._last_mid_price
+            self._last_mid_price = current_mid
+
+            # Determine which side SHOULD have the order based on price direction
+            # If price moving down -> submit BUY (price approaching bid level)
+            # If price moving up -> submit SELL (price approaching ask level)
+            # If price stable -> use distance to determine
+
+            dist_to_bid = current_mid - bid_price
+            dist_to_ask = ask_price - current_mid
+
+            if price_moving_down:
+                desired_side = "buy"
+            elif price_moving_up:
+                desired_side = "sell"
             else:
-                # No active order - determine which side to submit
-                # Only submit NON-MARKETABLE limit orders (orders that won't fill immediately)
-                # Buy limit is marketable if bid_price >= current_ask
-                # Sell limit is marketable if ask_price <= current_bid
+                # Price stable - pick closer side
+                desired_side = "buy" if dist_to_bid <= dist_to_ask else "sell"
 
-                buy_is_marketable = bid_price >= current_ask
-                sell_is_marketable = ask_price <= current_bid
+            # Check active orders and switch if needed
+            if self.active_buy_order_id:
+                # Check for fill first
+                filled = self._check_buy_order_fill(bid_price)
+                if filled:
+                    return
 
-                # Calculate distance to each level
-                dist_to_bid = current_mid - bid_price
-                dist_to_ask = ask_price - current_mid
+                # If we should be on sell side and price moved significantly, switch
+                if desired_side == "sell" and price_moving_up:
+                    self._cancel_and_switch_to_sell(ask_price)
 
-                # Prefer the closer side, but only if it's not marketable
-                if dist_to_bid <= dist_to_ask:
-                    # Prefer buy side
-                    if not buy_is_marketable:
-                        self._submit_limit_buy(bid_price)
-                    elif not sell_is_marketable:
-                        self._submit_limit_sell(ask_price)
-                    # else: both are marketable, wait for price to move
+            elif self.active_sell_order_id:
+                # Check for fill first
+                filled = self._check_sell_order_fill(ask_price)
+                if filled:
+                    return
+
+                # If we should be on buy side and price moved significantly, switch
+                if desired_side == "buy" and price_moving_down:
+                    self._cancel_and_switch_to_buy(bid_price)
+
+            else:
+                # No active order - submit based on desired side
+                if desired_side == "buy":
+                    self._submit_limit_buy(bid_price)
                 else:
-                    # Prefer sell side
-                    if not sell_is_marketable:
-                        self._submit_limit_sell(ask_price)
-                    elif not buy_is_marketable:
-                        self._submit_limit_buy(bid_price)
-                    # else: both are marketable, wait for price to move
+                    self._submit_limit_sell(ask_price)
+
+    def _check_buy_order_fill(self, current_bid_level: float) -> bool:
+        """Check if buy order filled. Returns True if filled."""
+        try:
+            order = trading.get_order(self.active_buy_order_id)
+
+            if order.status.value == "filled":
+                fill_price = float(order.filled_avg_price)
+                self._log(f"BUY FILLED @ ${fill_price:.2f}")
+                self._handle_buy_fill(fill_price)
+                self.active_buy_order_id = None
+                self.active_buy_price = 0.0
+                return True
+
+            elif order.status.value in ["canceled", "expired", "rejected"]:
+                self._log(f"Buy order {order.status.value}")
+                self.active_buy_order_id = None
+                self.active_buy_price = 0.0
+
+            # Update price if level changed
+            elif abs(current_bid_level - self.active_buy_price) > 0.01:
+                self._log(f"Updating buy: ${self.active_buy_price:.2f} -> ${current_bid_level:.2f}")
+                try:
+                    trading.cancel_order(self.active_buy_order_id)
+                except Exception:
+                    pass
+                self.active_buy_order_id = None
+                self.active_buy_price = 0.0
+                self._submit_limit_buy(current_bid_level)
+
+        except Exception as e:
+            self._log(f"Error checking buy order: {e}")
+            self.active_buy_order_id = None
+            self.active_buy_price = 0.0
+
+        return False
+
+    def _check_sell_order_fill(self, current_ask_level: float) -> bool:
+        """Check if sell order filled. Returns True if filled."""
+        try:
+            order = trading.get_order(self.active_sell_order_id)
+
+            if order.status.value == "filled":
+                fill_price = float(order.filled_avg_price)
+                self._log(f"SELL FILLED @ ${fill_price:.2f}")
+                self._handle_sell_fill(fill_price)
+                self.active_sell_order_id = None
+                self.active_sell_price = 0.0
+                return True
+
+            elif order.status.value in ["canceled", "expired", "rejected"]:
+                self._log(f"Sell order {order.status.value}")
+                self.active_sell_order_id = None
+                self.active_sell_price = 0.0
+
+            # Update price if level changed
+            elif abs(current_ask_level - self.active_sell_price) > 0.01:
+                self._log(f"Updating sell: ${self.active_sell_price:.2f} -> ${current_ask_level:.2f}")
+                try:
+                    trading.cancel_order(self.active_sell_order_id)
+                except Exception:
+                    pass
+                self.active_sell_order_id = None
+                self.active_sell_price = 0.0
+                self._submit_limit_sell(current_ask_level)
+
+        except Exception as e:
+            self._log(f"Error checking sell order: {e}")
+            self.active_sell_order_id = None
+            self.active_sell_price = 0.0
+
+        return False
+
+    def _cancel_and_switch_to_sell(self, ask_price: float):
+        """Cancel buy order and switch to sell side."""
+        try:
+            trading.cancel_order(self.active_buy_order_id)
+            self._log("Switching: canceled buy, submitting sell")
+        except Exception:
+            pass
+        self.active_buy_order_id = None
+        self.active_buy_price = 0.0
+        self._submit_limit_sell(ask_price)
+
+    def _cancel_and_switch_to_buy(self, bid_price: float):
+        """Cancel sell order and switch to buy side."""
+        try:
+            trading.cancel_order(self.active_sell_order_id)
+            self._log("Switching: canceled sell, submitting buy")
+        except Exception:
+            pass
+        self.active_sell_order_id = None
+        self.active_sell_price = 0.0
+        self._submit_limit_buy(bid_price)
 
     def _submit_limit_buy(self, price: float):
         """Submit a limit buy order."""
@@ -576,74 +687,6 @@ class LiveTrader:
             self._log(f"Limit SELL submitted: {order.id} @ ${price:.2f}")
         except Exception as e:
             self._log(f"Error submitting limit sell: {e}")
-
-    def _check_buy_order_status(self, current_bid_level: float):
-        """Check status of active buy order."""
-        try:
-            order = trading.get_order(self.active_buy_order_id)
-
-            if order.status.value == "filled":
-                fill_price = float(order.filled_avg_price)
-                self._log(f"BUY FILLED @ ${fill_price:.2f}")
-                self._handle_buy_fill(fill_price)
-                self.active_buy_order_id = None
-                self.active_buy_price = 0.0
-
-            elif order.status.value in ["canceled", "expired", "rejected"]:
-                self._log(f"Buy order {order.status.value}")
-                self.active_buy_order_id = None
-                self.active_buy_price = 0.0
-
-            else:
-                # Order still open - check if we need to update price
-                if abs(current_bid_level - self.active_buy_price) > 0.01:
-                    self._log(f"Bid level changed: ${self.active_buy_price:.2f} -> ${current_bid_level:.2f}")
-                    try:
-                        trading.cancel_order(self.active_buy_order_id)
-                        self._log("Canceled stale buy order")
-                    except Exception:
-                        pass
-                    self.active_buy_order_id = None
-                    self.active_buy_price = 0.0
-
-        except Exception as e:
-            self._log(f"Error checking buy order: {e}")
-            self.active_buy_order_id = None
-            self.active_buy_price = 0.0
-
-    def _check_sell_order_status(self, current_ask_level: float):
-        """Check status of active sell order."""
-        try:
-            order = trading.get_order(self.active_sell_order_id)
-
-            if order.status.value == "filled":
-                fill_price = float(order.filled_avg_price)
-                self._log(f"SELL FILLED @ ${fill_price:.2f}")
-                self._handle_sell_fill(fill_price)
-                self.active_sell_order_id = None
-                self.active_sell_price = 0.0
-
-            elif order.status.value in ["canceled", "expired", "rejected"]:
-                self._log(f"Sell order {order.status.value}")
-                self.active_sell_order_id = None
-                self.active_sell_price = 0.0
-
-            else:
-                # Order still open - check if we need to update price
-                if abs(current_ask_level - self.active_sell_price) > 0.01:
-                    self._log(f"Ask level changed: ${self.active_sell_price:.2f} -> ${current_ask_level:.2f}")
-                    try:
-                        trading.cancel_order(self.active_sell_order_id)
-                        self._log("Canceled stale sell order")
-                    except Exception:
-                        pass
-                    self.active_sell_order_id = None
-                    self.active_sell_price = 0.0
-
-        except Exception as e:
-            self._log(f"Error checking sell order: {e}")
-            self.active_sell_order_id = None
-            self.active_sell_price = 0.0
 
     def _handle_buy_fill(self, fill_price: float):
         """Handle a filled buy order."""
