@@ -503,8 +503,8 @@ class LiveTrader:
                 except Exception as e:
                     self._log(f"Error submitting sell order: {e}")
 
-            # Small delay to let first order settle
-            time.sleep(0.5)
+            # Longer delay to let first order settle in Alpaca's system
+            time.sleep(2)
 
             # Submit buy limit order SECOND
             if not self.active_buy_order_id:
