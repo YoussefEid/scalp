@@ -469,6 +469,7 @@ class LiveTrader:
         2. Submit order on the side closer to current market price
         3. Check for fills and retreat levels when filled
         4. Cancel and resubmit if price moves away significantly
+        5. Only submit non-marketable limit orders (won't fill immediately)
         """
         if not self.trading_active or not self.strategy:
             return
@@ -491,7 +492,9 @@ class LiveTrader:
             # Get current market price
             try:
                 quote = market_data.get_latest_quote(self.ticker)
-                current_mid = (float(quote.bid_price) + float(quote.ask_price)) / 2
+                current_bid = float(quote.bid_price)
+                current_ask = float(quote.ask_price)
+                current_mid = (current_bid + current_ask) / 2
             except Exception as e:
                 self._log(f"Error getting quote: {e}")
                 return
@@ -502,14 +505,33 @@ class LiveTrader:
             elif self.active_sell_order_id:
                 self._check_sell_order_status(ask_price)
             else:
-                # No active order - submit one based on which side is closer
+                # No active order - determine which side to submit
+                # Only submit NON-MARKETABLE limit orders (orders that won't fill immediately)
+                # Buy limit is marketable if bid_price >= current_ask
+                # Sell limit is marketable if ask_price <= current_bid
+
+                buy_is_marketable = bid_price >= current_ask
+                sell_is_marketable = ask_price <= current_bid
+
+                # Calculate distance to each level
                 dist_to_bid = current_mid - bid_price
                 dist_to_ask = ask_price - current_mid
 
+                # Prefer the closer side, but only if it's not marketable
                 if dist_to_bid <= dist_to_ask:
-                    self._submit_limit_buy(bid_price)
+                    # Prefer buy side
+                    if not buy_is_marketable:
+                        self._submit_limit_buy(bid_price)
+                    elif not sell_is_marketable:
+                        self._submit_limit_sell(ask_price)
+                    # else: both are marketable, wait for price to move
                 else:
-                    self._submit_limit_sell(ask_price)
+                    # Prefer sell side
+                    if not sell_is_marketable:
+                        self._submit_limit_sell(ask_price)
+                    elif not buy_is_marketable:
+                        self._submit_limit_buy(bid_price)
+                    # else: both are marketable, wait for price to move
 
     def _submit_limit_buy(self, price: float):
         """Submit a limit buy order."""
