@@ -181,30 +181,45 @@ class LiveTrader:
                 time.sleep(max(1, sleep_seconds))
 
     def _calculate_quote_width(self) -> float:
-        """Calculate quote width from historical data."""
-        self._log(f"Calculating quote width from last {self.lookback} day(s)...")
+        """Calculate quote width from daily high-low range."""
+        self._log(f"Calculating quote width from last {self.lookback} day(s) daily range...")
 
         end = datetime.now(ET)
-        start = end - timedelta(days=self.lookback + 5)
+        start = end - timedelta(days=self.lookback + 10)  # Extra days to ensure we get enough data
 
         try:
-            bars = market_data.get_bars_1min(self.ticker, start=start, end=end)
+            # Use DAILY bars, not 1-minute bars
+            bars = market_data.get_bars(
+                self.ticker,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+            )
 
             if bars.empty:
-                self._log("Warning: No historical bars found, using default 0.4%")
+                self._log("Warning: No historical daily bars found, using default 0.4%")
                 return 0.4
 
             bars_reset = bars.reset_index()
+
+            # Calculate daily range as percentage: (high - low) / close * 100
             bars_reset["range_pct"] = (
                 (bars_reset["high"] - bars_reset["low"]) / bars_reset["close"] * 100
             )
 
-            median_range = bars_reset["range_pct"].median()
-            self._log(f"Median bar range: {median_range:.4f}%")
+            # Get the most recent N days (lookback)
+            recent_bars = bars_reset.tail(self.lookback)
 
-            # If median range is 0 or very small (IEX data can be sparse), use default
-            if median_range < 0.01:
-                self._log("Warning: Median range too small (sparse IEX data), using default 0.4%")
+            if len(recent_bars) == 0:
+                self._log("Warning: No recent daily bars, using default 0.4%")
+                return 0.4
+
+            median_range = recent_bars["range_pct"].median()
+            self._log(f"Median daily range: {median_range:.4f}%")
+
+            # If median range is 0 or very small, use default
+            if median_range < 0.1:
+                self._log("Warning: Daily range too small, using default 0.4%")
                 return 0.4
 
             quote_width = median_range * self.multiplier
