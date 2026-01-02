@@ -554,6 +554,9 @@ class LiveTrader:
                 if self.flatten_on_stop and self.strategy.state.position != 0:
                     self._flatten_position_market()
 
+        except Exception as e:
+            self._log(f"Error executing market sell: {e}")
+
     def _flatten_position_market(self):
         """Flatten position using market order."""
         if not self.strategy or self.strategy.state.position == 0:
