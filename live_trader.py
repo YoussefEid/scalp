@@ -461,10 +461,11 @@ class LiveTrader:
             except Exception as e:
                 self._log(f"Error canceling sell order: {e}")
 
-    def _submit_resting_orders(self):
-        """Submit limit orders at current bid/ask levels.
+    def _check_and_execute(self):
+        """Check current price and execute market orders when levels are hit.
 
-        Submit both BUY and SELL orders to capture whichever direction price moves.
+        Instead of pre-submitting limit orders (which Alpaca blocks for opposing sides),
+        we monitor price and execute market orders when our bid/ask levels are touched.
         """
         if not self.trading_active or not self.strategy:
             return
@@ -472,7 +473,7 @@ class LiveTrader:
         # Check market hours
         now = datetime.now(ET)
         if now.hour == 15 and now.minute >= 55:
-            self._log("Near market close, not submitting new orders")
+            self._log("Near market close, stopping execution")
             return
         if now.hour >= 16:
             return
@@ -485,42 +486,73 @@ class LiveTrader:
             bid_price = round(bid.price, 2)
             ask_price = round(ask.price, 2)
 
-            self._log(f"Position: {position} | BUY @ ${bid_price:.2f} | SELL @ ${ask_price:.2f}")
+            # Get current market price
+            try:
+                quote = market_data.get_latest_quote(self.ticker)
+                current_bid = float(quote.bid_price)
+                current_ask = float(quote.ask_price)
+            except Exception as e:
+                self._log(f"Error getting quote: {e}")
+                return
 
-            # Submit sell limit order FIRST (to establish short if price goes up)
-            if not self.active_sell_order_id:
-                try:
-                    order = trading.place_limit_order(
-                        self.ticker,
-                        self.trade_size,
-                        OrderSide.SELL,
-                        ask_price,
-                        TimeInForce.DAY,
-                    )
-                    self.active_sell_order_id = str(order.id)
-                    self.active_sell_price = ask_price
-                    self._log(f"Sell order submitted: {self.active_sell_order_id[:8]}... @ ${ask_price:.2f}")
-                except Exception as e:
-                    self._log(f"Error submitting sell order: {e}")
+            # Check if price hits our BUY level (current ask <= our bid)
+            if current_ask <= bid_price:
+                self._log(f"BUY TRIGGER: Market ask ${current_ask:.2f} <= Bid level ${bid_price:.2f}")
+                self._execute_market_buy(bid_price)
 
-            # Longer delay to let first order settle in Alpaca's system
-            time.sleep(2)
+            # Check if price hits our SELL level (current bid >= our ask)
+            elif current_bid >= ask_price:
+                self._log(f"SELL TRIGGER: Market bid ${current_bid:.2f} >= Ask level ${ask_price:.2f}")
+                self._execute_market_sell(ask_price)
 
-            # Submit buy limit order SECOND
-            if not self.active_buy_order_id:
-                try:
-                    order = trading.place_limit_order(
-                        self.ticker,
-                        self.trade_size,
-                        OrderSide.BUY,
-                        bid_price,
-                        TimeInForce.DAY,
-                    )
-                    self.active_buy_order_id = str(order.id)
-                    self.active_buy_price = bid_price
-                    self._log(f"Buy order submitted: {self.active_buy_order_id[:8]}... @ ${bid_price:.2f}")
-                except Exception as e:
-                    self._log(f"Error submitting buy order: {e}")
+    def _execute_market_buy(self, expected_price: float):
+        """Execute a market buy order."""
+        try:
+            order = trading.buy(self.ticker, self.trade_size)
+            self._log(f"Market BUY executed: {order.id}")
+
+            # Update strategy state
+            timestamp = datetime.now(ET)
+            trade = self.strategy._execute_buy(
+                timestamp, expected_price, self.trade_size,
+                reason=f"Market order (target ${expected_price:.2f})"
+            )
+            self.strategy._retreat_after_buy()
+
+            self._log_trade_fill(trade, str(order.id))
+
+            # Check stop loss
+            if self.strategy._check_stop_loss():
+                self._log("STOP LOSS TRIGGERED!")
+                self.trading_active = False
+                if self.flatten_on_stop and self.strategy.state.position != 0:
+                    self._flatten_position_market()
+
+        except Exception as e:
+            self._log(f"Error executing market buy: {e}")
+
+    def _execute_market_sell(self, expected_price: float):
+        """Execute a market sell order."""
+        try:
+            order = trading.sell(self.ticker, self.trade_size)
+            self._log(f"Market SELL executed: {order.id}")
+
+            # Update strategy state
+            timestamp = datetime.now(ET)
+            trade = self.strategy._execute_sell(
+                timestamp, expected_price, self.trade_size,
+                reason=f"Market order (target ${expected_price:.2f})"
+            )
+            self.strategy._retreat_after_sell()
+
+            self._log_trade_fill(trade, str(order.id))
+
+            # Check stop loss
+            if self.strategy._check_stop_loss():
+                self._log("STOP LOSS TRIGGERED!")
+                self.trading_active = False
+                if self.flatten_on_stop and self.strategy.state.position != 0:
+                    self._flatten_position_market()
 
     def _flatten_position_market(self):
         """Flatten position using market order."""
@@ -600,7 +632,7 @@ class LiveTrader:
         """Start the live trading session."""
         self._log("=" * 50)
         self._log(f"Starting Live Trader for {self.ticker}")
-        self._log("Execution mode: Pre-submitted LIMIT orders")
+        self._log("Execution mode: MARKET orders on price trigger")
         self._log("=" * 50)
 
         config.print_mode()
@@ -626,17 +658,10 @@ class LiveTrader:
                 self.zero_point = self._get_opening_price()
                 self._init_strategy()
 
-                # Start trade updates stream
-                self._start_trade_stream()
-
-                # Allow a moment for stream to connect
-                time.sleep(2)
-
-                # Submit initial resting orders
+                # Start trading
                 self.trading_active = True
-                self._submit_resting_orders()
 
-                # Main loop: monitor and log status
+                # Main loop: monitor price and execute
                 self._run_trading_loop()
 
                 # End of day
@@ -647,7 +672,7 @@ class LiveTrader:
                 time.sleep(60)
 
     def _run_trading_loop(self):
-        """Main trading loop - monitors status while orders rest."""
+        """Main trading loop - monitors price and executes market orders."""
         last_status_log = time.time()
         status_interval = 60  # Log status every minute
 
@@ -660,13 +685,12 @@ class LiveTrader:
                     self._log_status()
                     last_status_log = now
 
-                # Check if we need to resubmit orders (e.g., after cancel)
+                # Check price and execute if levels are hit
                 if self.trading_active:
-                    with self.order_lock:
-                        if not self.active_buy_order_id or not self.active_sell_order_id:
-                            self._submit_resting_orders()
+                    self._check_and_execute()
 
-                time.sleep(1)
+                # Poll every 100ms for faster response
+                time.sleep(0.1)
 
             except Exception as e:
                 self._log(f"Error in trading loop: {e}")
