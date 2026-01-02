@@ -487,23 +487,7 @@ class LiveTrader:
 
             self._log(f"Position: {position} | BUY @ ${bid_price:.2f} | SELL @ ${ask_price:.2f}")
 
-            # Submit buy limit order
-            if not self.active_buy_order_id:
-                try:
-                    order = trading.place_limit_order(
-                        self.ticker,
-                        self.trade_size,
-                        OrderSide.BUY,
-                        bid_price,
-                        TimeInForce.DAY,
-                    )
-                    self.active_buy_order_id = str(order.id)
-                    self.active_buy_price = bid_price
-                    self._log(f"Buy order submitted: {self.active_buy_order_id[:8]}... @ ${bid_price:.2f}")
-                except Exception as e:
-                    self._log(f"Error submitting buy order: {e}")
-
-            # Submit sell limit order
+            # Submit sell limit order FIRST (to establish short if price goes up)
             if not self.active_sell_order_id:
                 try:
                     order = trading.place_limit_order(
@@ -518,6 +502,25 @@ class LiveTrader:
                     self._log(f"Sell order submitted: {self.active_sell_order_id[:8]}... @ ${ask_price:.2f}")
                 except Exception as e:
                     self._log(f"Error submitting sell order: {e}")
+
+            # Small delay to let first order settle
+            time.sleep(0.5)
+
+            # Submit buy limit order SECOND
+            if not self.active_buy_order_id:
+                try:
+                    order = trading.place_limit_order(
+                        self.ticker,
+                        self.trade_size,
+                        OrderSide.BUY,
+                        bid_price,
+                        TimeInForce.DAY,
+                    )
+                    self.active_buy_order_id = str(order.id)
+                    self.active_buy_price = bid_price
+                    self._log(f"Buy order submitted: {self.active_buy_order_id[:8]}... @ ${bid_price:.2f}")
+                except Exception as e:
+                    self._log(f"Error submitting buy order: {e}")
 
     def _flatten_position_market(self):
         """Flatten position using market order."""
