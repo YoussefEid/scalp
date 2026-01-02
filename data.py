@@ -9,6 +9,7 @@ import pandas as pd
 
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 from client import get_client
 
@@ -70,6 +71,7 @@ class MarketData:
             start=start,
             end=end,
             limit=limit,
+            feed=DataFeed.IEX,  # Use IEX for free tier
         )
         bars = self._client.get_stock_bars(request)
         return bars.df
@@ -106,6 +108,7 @@ class MarketData:
             start=start,
             end=end,
             limit=limit,
+            feed=DataFeed.IEX,  # Use IEX for free tier
         )
         bars = self._client.get_stock_bars(request)
         return bars.df
