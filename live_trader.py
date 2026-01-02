@@ -462,10 +462,13 @@ class LiveTrader:
                 self._log(f"Error canceling sell order: {e}")
 
     def _check_and_execute(self):
-        """Check current price and execute market orders when levels are hit.
+        """Manage limit orders - submit one at a time and check for fills.
 
-        Instead of pre-submitting limit orders (which Alpaca blocks for opposing sides),
-        we monitor price and execute market orders when our bid/ask levels are touched.
+        Strategy:
+        1. Only one limit order active at a time (avoids Alpaca's restriction)
+        2. Submit order on the side closer to current market price
+        3. Check for fills and retreat levels when filled
+        4. Cancel and resubmit if price moves away significantly
         """
         if not self.trading_active or not self.strategy:
             return
@@ -480,7 +483,6 @@ class LiveTrader:
 
         with self.order_lock:
             bid, ask = self.strategy.state.get_quotes()
-            position = self.strategy.state.position
 
             # Round prices to 2 decimal places
             bid_price = round(bid.price, 2)
@@ -489,73 +491,151 @@ class LiveTrader:
             # Get current market price
             try:
                 quote = market_data.get_latest_quote(self.ticker)
-                current_bid = float(quote.bid_price)
-                current_ask = float(quote.ask_price)
+                current_mid = (float(quote.bid_price) + float(quote.ask_price)) / 2
             except Exception as e:
                 self._log(f"Error getting quote: {e}")
                 return
 
-            # Check if price hits our BUY level (current ask <= our bid)
-            if current_ask <= bid_price:
-                self._log(f"BUY TRIGGER: Market ask ${current_ask:.2f} <= Bid level ${bid_price:.2f}")
-                self._execute_market_buy(bid_price)
+            # Check if we have an active order
+            if self.active_buy_order_id:
+                self._check_buy_order_status(bid_price)
+            elif self.active_sell_order_id:
+                self._check_sell_order_status(ask_price)
+            else:
+                # No active order - submit one based on which side is closer
+                dist_to_bid = current_mid - bid_price
+                dist_to_ask = ask_price - current_mid
 
-            # Check if price hits our SELL level (current bid >= our ask)
-            elif current_bid >= ask_price:
-                self._log(f"SELL TRIGGER: Market bid ${current_bid:.2f} >= Ask level ${ask_price:.2f}")
-                self._execute_market_sell(ask_price)
+                if dist_to_bid <= dist_to_ask:
+                    self._submit_limit_buy(bid_price)
+                else:
+                    self._submit_limit_sell(ask_price)
 
-    def _execute_market_buy(self, expected_price: float):
-        """Execute a market buy order."""
+    def _submit_limit_buy(self, price: float):
+        """Submit a limit buy order."""
         try:
-            order = trading.buy(self.ticker, self.trade_size)
-            self._log(f"Market BUY executed: {order.id}")
-
-            # Update strategy state
-            timestamp = datetime.now(ET)
-            trade = self.strategy._execute_buy(
-                timestamp, expected_price, self.trade_size,
-                reason=f"Market order (target ${expected_price:.2f})"
+            order = trading.place_limit_order(
+                self.ticker, self.trade_size, OrderSide.BUY, price
             )
-            self.strategy._retreat_after_buy()
+            self.active_buy_order_id = str(order.id)
+            self.active_buy_price = price
+            self._log(f"Limit BUY submitted: {order.id} @ ${price:.2f}")
+        except Exception as e:
+            self._log(f"Error submitting limit buy: {e}")
 
-            self._log_trade_fill(trade, str(order.id))
+    def _submit_limit_sell(self, price: float):
+        """Submit a limit sell order."""
+        try:
+            order = trading.place_limit_order(
+                self.ticker, self.trade_size, OrderSide.SELL, price
+            )
+            self.active_sell_order_id = str(order.id)
+            self.active_sell_price = price
+            self._log(f"Limit SELL submitted: {order.id} @ ${price:.2f}")
+        except Exception as e:
+            self._log(f"Error submitting limit sell: {e}")
 
-            # Check stop loss
-            if self.strategy._check_stop_loss():
-                self._log("STOP LOSS TRIGGERED!")
-                self.trading_active = False
-                if self.flatten_on_stop and self.strategy.state.position != 0:
-                    self._flatten_position_market()
+    def _check_buy_order_status(self, current_bid_level: float):
+        """Check status of active buy order."""
+        try:
+            order = trading.get_order(self.active_buy_order_id)
+
+            if order.status.value == "filled":
+                fill_price = float(order.filled_avg_price)
+                self._log(f"BUY FILLED @ ${fill_price:.2f}")
+                self._handle_buy_fill(fill_price)
+                self.active_buy_order_id = None
+                self.active_buy_price = 0.0
+
+            elif order.status.value in ["canceled", "expired", "rejected"]:
+                self._log(f"Buy order {order.status.value}")
+                self.active_buy_order_id = None
+                self.active_buy_price = 0.0
+
+            else:
+                # Order still open - check if we need to update price
+                if abs(current_bid_level - self.active_buy_price) > 0.01:
+                    self._log(f"Bid level changed: ${self.active_buy_price:.2f} -> ${current_bid_level:.2f}")
+                    try:
+                        trading.cancel_order(self.active_buy_order_id)
+                        self._log("Canceled stale buy order")
+                    except Exception:
+                        pass
+                    self.active_buy_order_id = None
+                    self.active_buy_price = 0.0
 
         except Exception as e:
-            self._log(f"Error executing market buy: {e}")
+            self._log(f"Error checking buy order: {e}")
+            self.active_buy_order_id = None
+            self.active_buy_price = 0.0
 
-    def _execute_market_sell(self, expected_price: float):
-        """Execute a market sell order."""
+    def _check_sell_order_status(self, current_ask_level: float):
+        """Check status of active sell order."""
         try:
-            order = trading.sell(self.ticker, self.trade_size)
-            self._log(f"Market SELL executed: {order.id}")
+            order = trading.get_order(self.active_sell_order_id)
 
-            # Update strategy state
-            timestamp = datetime.now(ET)
-            trade = self.strategy._execute_sell(
-                timestamp, expected_price, self.trade_size,
-                reason=f"Market order (target ${expected_price:.2f})"
-            )
-            self.strategy._retreat_after_sell()
+            if order.status.value == "filled":
+                fill_price = float(order.filled_avg_price)
+                self._log(f"SELL FILLED @ ${fill_price:.2f}")
+                self._handle_sell_fill(fill_price)
+                self.active_sell_order_id = None
+                self.active_sell_price = 0.0
 
-            self._log_trade_fill(trade, str(order.id))
+            elif order.status.value in ["canceled", "expired", "rejected"]:
+                self._log(f"Sell order {order.status.value}")
+                self.active_sell_order_id = None
+                self.active_sell_price = 0.0
 
-            # Check stop loss
-            if self.strategy._check_stop_loss():
-                self._log("STOP LOSS TRIGGERED!")
-                self.trading_active = False
-                if self.flatten_on_stop and self.strategy.state.position != 0:
-                    self._flatten_position_market()
+            else:
+                # Order still open - check if we need to update price
+                if abs(current_ask_level - self.active_sell_price) > 0.01:
+                    self._log(f"Ask level changed: ${self.active_sell_price:.2f} -> ${current_ask_level:.2f}")
+                    try:
+                        trading.cancel_order(self.active_sell_order_id)
+                        self._log("Canceled stale sell order")
+                    except Exception:
+                        pass
+                    self.active_sell_order_id = None
+                    self.active_sell_price = 0.0
 
         except Exception as e:
-            self._log(f"Error executing market sell: {e}")
+            self._log(f"Error checking sell order: {e}")
+            self.active_sell_order_id = None
+            self.active_sell_price = 0.0
+
+    def _handle_buy_fill(self, fill_price: float):
+        """Handle a filled buy order."""
+        timestamp = datetime.now(ET)
+        trade = self.strategy._execute_buy(
+            timestamp, fill_price, self.trade_size,
+            reason=f"Limit order filled @ ${fill_price:.2f}"
+        )
+        self.strategy._retreat_after_buy()
+        self._log_trade_fill(trade, self.active_buy_order_id)
+
+        # Check stop loss
+        if self.strategy._check_stop_loss():
+            self._log("STOP LOSS TRIGGERED!")
+            self.trading_active = False
+            if self.flatten_on_stop and self.strategy.state.position != 0:
+                self._flatten_position_market()
+
+    def _handle_sell_fill(self, fill_price: float):
+        """Handle a filled sell order."""
+        timestamp = datetime.now(ET)
+        trade = self.strategy._execute_sell(
+            timestamp, fill_price, self.trade_size,
+            reason=f"Limit order filled @ ${fill_price:.2f}"
+        )
+        self.strategy._retreat_after_sell()
+        self._log_trade_fill(trade, self.active_sell_order_id)
+
+        # Check stop loss
+        if self.strategy._check_stop_loss():
+            self._log("STOP LOSS TRIGGERED!")
+            self.trading_active = False
+            if self.flatten_on_stop and self.strategy.state.position != 0:
+                self._flatten_position_market()
 
     def _flatten_position_market(self):
         """Flatten position using market order."""
@@ -635,7 +715,7 @@ class LiveTrader:
         """Start the live trading session."""
         self._log("=" * 50)
         self._log(f"Starting Live Trader for {self.ticker}")
-        self._log("Execution mode: MARKET orders on price trigger")
+        self._log("Execution mode: LIMIT orders (one at a time)")
         self._log("=" * 50)
 
         config.print_mode()
