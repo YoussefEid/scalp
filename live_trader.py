@@ -164,7 +164,26 @@ class LiveTrader:
                 time.sleep(max(1, sleep_seconds))
 
     def _calculate_quote_width(self) -> float:
-        """Calculate quote width from daily high-low range."""
+        """Calculate quote width from daily high-low range using Alpha Vantage."""
+        self._log(f"Calculating quote width from last {self.lookback} day(s) daily range...")
+
+        # Always use Alpha Vantage for daily bars (more reliable than IB for historical data)
+        try:
+            quote_width = alpha_vantage.calculate_quote_width(self.ticker, self.lookback)
+            if quote_width is not None and quote_width >= 0.1:
+                self._log(f"Alpha Vantage median daily range: {quote_width:.4f}%")
+                result = quote_width * self.multiplier
+                self._log(f"Quote width (with {self.multiplier}x multiplier): {result:.4f}%")
+                return result
+            else:
+                self._log("Alpha Vantage returned invalid quote width, using default 0.4%")
+                return 0.4
+        except Exception as e:
+            self._log(f"Alpha Vantage failed: {e}, using default 0.4%")
+            return 0.4
+
+    def _calculate_quote_width_unused(self) -> float:
+        """OLD: Calculate quote width from daily high-low range using IB with fallback."""
         self._log(f"Calculating quote width from last {self.lookback} day(s) daily range...")
 
         # Use naive datetime for IB API compatibility
@@ -234,79 +253,40 @@ class LiveTrader:
             return 0.4
 
     def _check_regime_filter(self) -> bool:
-        """Check if today passes the regime filter."""
+        """Check if today passes the regime filter using Alpha Vantage."""
         if not self.enable_regime_filter:
             return True
 
         self._log(f"Checking regime filter (threshold: {self.regime_threshold}%)...")
 
-        # Use naive datetime for IB API compatibility
-        now_et = datetime.now(ET)
-        end = datetime(now_et.year, now_et.month, now_et.day, now_et.hour, now_et.minute, now_et.second)
-        start = end - timedelta(days=self.regime_lookback + 10)
-
-        bars = None
+        # Always use Alpha Vantage for daily bars
         try:
-            bars = market_data.get_bars(
-                self.ticker,
-                timeframe=TimeFrame.Day,
-                start=start,
-                end=end,
-            )
-        except Exception as e:
-            self._log(f"IB daily bars failed for regime filter: {e}")
+            av_bars = alpha_vantage.get_daily_bars(self.ticker, outputsize="compact")
+            if av_bars is not None and len(av_bars) >= self.regime_lookback:
+                recent_bars = av_bars.tail(self.regime_lookback).copy()
+                recent_bars["range_pct"] = (
+                    (recent_bars["high"] - recent_bars["low"]) / recent_bars["close"] * 100
+                )
+                avg_range = recent_bars["range_pct"].mean()
 
-        # Fallback to Alpha Vantage if IB fails
-        if bars is None or bars.empty or len(bars) < self.regime_lookback:
-            self._log("IB returned insufficient data for regime filter, trying Alpha Vantage...")
-            try:
-                av_bars = alpha_vantage.get_daily_bars(self.ticker, outputsize="compact")
-                if av_bars is not None and len(av_bars) >= self.regime_lookback:
-                    recent_bars = av_bars.tail(self.regime_lookback).copy()
-                    recent_bars["range_pct"] = (
-                        (recent_bars["high"] - recent_bars["low"]) / recent_bars["close"] * 100
-                    )
-                    avg_range = recent_bars["range_pct"].mean()
+                self._log(f"Avg daily range (last {self.regime_lookback} days): {avg_range:.2f}%")
 
-                    self._log(f"Alpha Vantage avg daily range (last {self.regime_lookback} days): {avg_range:.2f}%")
+                if avg_range > self.regime_threshold:
+                    self._log(f"Regime filter BLOCKED: {avg_range:.2f}% > {self.regime_threshold}%")
+                    return False
 
-                    if avg_range > self.regime_threshold:
-                        self._log(f"Regime filter BLOCKED: {avg_range:.2f}% > {self.regime_threshold}%")
-                        return False
-
-                    self._log("Regime filter PASSED")
-                    return True
-                else:
-                    self._log("Alpha Vantage also returned insufficient data, allowing trading")
-                    return True
-            except Exception as e:
-                self._log(f"Alpha Vantage also failed: {e}, allowing trading")
+                self._log("Regime filter PASSED")
                 return True
-
-        try:
-            bars_reset = bars.reset_index().tail(self.regime_lookback)
-            bars_reset = bars_reset.copy()
-            bars_reset["range_pct"] = (
-                (bars_reset["high"] - bars_reset["low"]) / bars_reset["close"] * 100
-            )
-            avg_range = bars_reset["range_pct"].mean()
-
-            self._log(f"Avg daily range (last {self.regime_lookback} days): {avg_range:.2f}%")
-
-            if avg_range > self.regime_threshold:
-                self._log(f"Regime filter BLOCKED: {avg_range:.2f}% > {self.regime_threshold}%")
-                return False
-
-            self._log("Regime filter PASSED")
-            return True
-
+            else:
+                self._log("Alpha Vantage returned insufficient data, allowing trading")
+                return True
         except Exception as e:
-            self._log(f"Error checking regime filter: {e}")
+            self._log(f"Alpha Vantage failed: {e}, allowing trading")
             return True
 
     def _check_gap_filter(self, opening_price: float) -> bool:
         """
-        Check if today passes the gap filter.
+        Check if today passes the gap filter using Alpha Vantage.
 
         Skip trading if the stock gaps UP more than the threshold percentage
         from the previous day's close. Gap downs are allowed (mean reversion
@@ -323,41 +303,16 @@ class LiveTrader:
 
         self._log(f"Checking gap filter (threshold: {self.gap_up_threshold}%)...")
 
-        prev_close = None
-
-        # Use naive datetime for IB API compatibility
-        now_et = datetime.now(ET)
-        end = datetime(now_et.year, now_et.month, now_et.day, now_et.hour, now_et.minute, now_et.second)
-        start = end - timedelta(days=5)  # Get a few days to ensure we have yesterday's close
-
+        # Always use Alpha Vantage for daily bars
         try:
-            bars = market_data.get_bars(
-                self.ticker,
-                timeframe=TimeFrame.Day,
-                start=start,
-                end=end,
-            )
-
-            if bars is not None and not bars.empty and len(bars) >= 2:
-                # Get previous day's close (second to last bar)
-                bars_reset = bars.reset_index()
-                prev_close = float(bars_reset.iloc[-2]["close"])
-        except Exception as e:
-            self._log(f"IB daily bars failed for gap filter: {e}")
-
-        # Fallback to Alpha Vantage if IB fails
-        if prev_close is None:
-            self._log("IB returned insufficient data for gap filter, trying Alpha Vantage...")
-            try:
-                prev_close = alpha_vantage.get_previous_close(self.ticker)
-                if prev_close is not None:
-                    self._log(f"Alpha Vantage previous close: ${prev_close:.2f}")
-                else:
-                    self._log("Alpha Vantage also returned no data, allowing trading")
-                    return True
-            except Exception as e:
-                self._log(f"Alpha Vantage also failed: {e}, allowing trading")
+            prev_close = alpha_vantage.get_previous_close(self.ticker)
+            if prev_close is None:
+                self._log("Alpha Vantage returned no data, allowing trading")
                 return True
+            self._log(f"Previous close: ${prev_close:.2f}")
+        except Exception as e:
+            self._log(f"Alpha Vantage failed: {e}, allowing trading")
+            return True
 
         # Calculate gap percentage (positive = gap up, negative = gap down)
         gap_pct = (opening_price - prev_close) / prev_close * 100
