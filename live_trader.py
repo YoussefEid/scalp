@@ -314,22 +314,30 @@ class LiveTrader:
         """Get the opening price for today."""
         self._log("Waiting for opening price...")
 
-        while self.running:
-            now = datetime.now(ET)
-            if now.hour == 9 and now.minute >= 30:
-                break
-            if now.hour > 9:
-                break
-            time.sleep(1)
+        now = datetime.now(ET)
 
-        today = datetime.now(ET).replace(hour=9, minute=30, second=0, microsecond=0)
+        # If before 9:30, wait for market open
+        if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+            while self.running:
+                now = datetime.now(ET)
+                if now.hour == 9 and now.minute >= 30:
+                    break
+                if now.hour > 9:
+                    break
+                time.sleep(1)
+
+        # Get today's 9:30 AM as start time for fetching opening bar
+        market_open = datetime.now(ET).replace(hour=9, minute=30, second=0, microsecond=0)
+        now = datetime.now(ET)
 
         for attempt in range(10):
             try:
+                # Fetch bars from market open to now (or at least first 5 min)
+                end_time = max(market_open + timedelta(minutes=5), now)
                 bars = market_data.get_bars_1min(
                     self.ticker,
-                    start=today,
-                    end=today + timedelta(minutes=5),
+                    start=market_open,
+                    end=end_time,
                     limit=1,
                 )
 
