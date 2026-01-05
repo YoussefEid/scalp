@@ -224,7 +224,7 @@ class MarketData:
         if not df.empty:
             df.set_index("timestamp", inplace=True)
 
-            # Filter by start date (handle timezone-aware index)
+            # Filter by start date (handle timezone-aware index and date objects)
             # Check if index has tz attribute (DatetimeIndex) and if it's set
             try:
                 if hasattr(df.index, 'tz') and df.index.tz is not None:
@@ -233,10 +233,18 @@ class MarketData:
                     start_tz = pytz.timezone(str(df.index.tz)).localize(start)
                     df = df[df.index >= start_tz]
                 else:
-                    df = df[df.index >= start]
+                    # Check if index contains date objects (daily bars) vs datetime
+                    if len(df.index) > 0 and hasattr(df.index[0], 'year') and not hasattr(df.index[0], 'hour'):
+                        # Index has date objects, convert start to date for comparison
+                        df = df[df.index >= start.date()]
+                    else:
+                        df = df[df.index >= start]
             except (TypeError, AttributeError):
-                # Fallback for non-datetime indices (e.g., daily bars with date objects)
-                df = df[df.index >= start]
+                # Fallback: try converting start to date if comparison fails
+                try:
+                    df = df[df.index >= start.date()]
+                except:
+                    pass  # Keep all data if comparison fails
 
             # Apply limit
             if limit:

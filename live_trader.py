@@ -327,8 +327,10 @@ class LiveTrader:
                 time.sleep(1)
 
         # Get today's 9:30 AM as start time for fetching opening bar
-        market_open = datetime.now(ET).replace(hour=9, minute=30, second=0, microsecond=0)
-        now = datetime.now(ET)
+        # Use naive datetime (no timezone) for IB API compatibility
+        now_et = datetime.now(ET)
+        market_open = datetime(now_et.year, now_et.month, now_et.day, 9, 30, 0)
+        now = datetime(now_et.year, now_et.month, now_et.day, now_et.hour, now_et.minute, now_et.second)
 
         for attempt in range(10):
             try:
@@ -367,7 +369,8 @@ class LiveTrader:
             trade_size=self.trade_size,
             quote_width_multiplier=1.0,
             enable_stop_loss=self.enable_stop_loss,
-            consecutive_trade_limit=self.consecutive_limit,
+            consecutive_buy_limit=self.consecutive_limit,
+            consecutive_sell_limit=self.consecutive_limit,
             flatten_on_stop=self.flatten_on_stop,
         )
 
