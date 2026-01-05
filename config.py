@@ -32,6 +32,9 @@ class Config:
     # Timeout for connection
     TIMEOUT: int = int(os.getenv("IB_TIMEOUT", "20"))
 
+    # Alpha Vantage API (fallback for historical data)
+    ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "F21E3SA6HL8XS3CL")
+
     @classmethod
     def validate(cls) -> bool:
         """Validate that connection settings are valid."""
