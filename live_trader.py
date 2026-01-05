@@ -166,7 +166,9 @@ class LiveTrader:
         """Calculate quote width from daily high-low range."""
         self._log(f"Calculating quote width from last {self.lookback} day(s) daily range...")
 
-        end = datetime.now(ET)
+        # Use naive datetime for IB API compatibility
+        now_et = datetime.now(ET)
+        end = datetime(now_et.year, now_et.month, now_et.day, now_et.hour, now_et.minute, now_et.second)
         start = end - timedelta(days=self.lookback + 10)  # Extra days to ensure we get enough data
 
         try:
@@ -220,7 +222,9 @@ class LiveTrader:
 
         self._log(f"Checking regime filter (threshold: {self.regime_threshold}%)...")
 
-        end = datetime.now(ET)
+        # Use naive datetime for IB API compatibility
+        now_et = datetime.now(ET)
+        end = datetime(now_et.year, now_et.month, now_et.day, now_et.hour, now_et.minute, now_et.second)
         start = end - timedelta(days=self.regime_lookback + 10)
 
         try:
@@ -273,7 +277,9 @@ class LiveTrader:
 
         self._log(f"Checking gap filter (threshold: {self.gap_up_threshold}%)...")
 
-        end = datetime.now(ET)
+        # Use naive datetime for IB API compatibility
+        now_et = datetime.now(ET)
+        end = datetime(now_et.year, now_et.month, now_et.day, now_et.hour, now_et.minute, now_et.second)
         start = end - timedelta(days=5)  # Get a few days to ensure we have yesterday's close
 
         try:
