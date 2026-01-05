@@ -1,5 +1,5 @@
 """
-Entry point for Alpaca trading bot.
+Entry point for IB Gateway trading bot.
 Tests connection and demonstrates basic functionality.
 """
 import argparse
@@ -7,14 +7,25 @@ from datetime import datetime, timedelta
 
 from config import config
 from trading import trading
-from data import market_data
+from data import market_data, TimeFrame
+from client import get_client
 
 
 def test_connection():
-    """Test connection to Alpaca and display account info."""
+    """Test connection to IB Gateway and display account info."""
     print("=" * 50)
-    print("Alpaca Trading Bot - Connection Test")
+    print("IB Gateway Trading Bot - Connection Test")
     print("=" * 50)
+
+    # Connect to IB Gateway
+    client = get_client()
+    if not client.connect():
+        print("Failed to connect to IB Gateway!")
+        print("\nMake sure:")
+        print("  1. IB Gateway is running")
+        print("  2. API connections are enabled in IB Gateway settings")
+        print("  3. Port matches (4002 for paper, 4001 for live)")
+        return False
 
     # Show trading mode
     config.print_mode()
@@ -24,10 +35,10 @@ def test_connection():
     print("--- Account Info ---")
     account = trading.get_account()
     print(f"Status: {account.status}")
-    print(f"Buying Power: ${float(account.buying_power):,.2f}")
-    print(f"Cash: ${float(account.cash):,.2f}")
-    print(f"Portfolio Value: ${float(account.portfolio_value):,.2f}")
-    print(f"Equity: ${float(account.equity):,.2f}")
+    print(f"Buying Power: ${account.buying_power:,.2f}")
+    print(f"Cash: ${account.cash:,.2f}")
+    print(f"Portfolio Value: ${account.portfolio_value:,.2f}")
+    print(f"Equity: ${account.equity:,.2f}")
     print()
 
     # Get positions
@@ -35,13 +46,15 @@ def test_connection():
     positions = trading.get_positions()
     if positions:
         for pos in positions:
-            pl = float(pos.unrealized_pl)
+            pl = pos.unrealized_pl
             pl_sign = "+" if pl >= 0 else ""
-            print(f"{pos.symbol}: {pos.qty} shares @ ${float(pos.avg_entry_price):.2f}")
-            print(f"  Current: ${float(pos.current_price):.2f} | P/L: {pl_sign}${pl:.2f}")
+            print(f"{pos.symbol}: {pos.qty} shares @ ${pos.avg_entry_price:.2f}")
+            print(f"  Current: ${pos.current_price:.2f} | P/L: {pl_sign}${pl:.2f}")
     else:
         print("No open positions")
     print()
+
+    return True
 
 
 def test_market_data():
@@ -74,30 +87,38 @@ def test_market_data():
     print()
 
 
-def test_streaming():
-    """Test real-time bar streaming (runs for 30 seconds)."""
-    print("--- Real-time Streaming Test ---")
-    print("Subscribing to AAPL 1-minute bars...")
-    print("(Will run for 30 seconds or until market closes)")
+def test_order():
+    """Test placing a limit order (immediately canceled)."""
+    symbol = "AAPL"
+
+    print("--- Order Test ---")
+    print(f"Testing limit order for {symbol}...")
+
+    # Get current quote
+    quote = market_data.get_latest_quote(symbol)
+    bid = quote.bid_price
+
+    # Place a limit buy order far below market (won't fill)
+    test_price = round(bid * 0.95, 2)  # 5% below bid
+    print(f"Placing limit BUY @ ${test_price:.2f} (won't fill - 5% below bid)")
+
+    from trading import OrderSide
+    order = trading.place_limit_order(symbol, 1, OrderSide.BUY, test_price)
+    print(f"Order ID: {order.id}")
+    print(f"Status: {order.status.value}")
+
+    # Cancel the order
+    print("Canceling order...")
+    trading.cancel_order(order.id)
+    get_client().sleep(0.5)
+
+    # Verify canceled
+    updated_order = trading.get_order(order.id)
+    if updated_order:
+        print(f"Final status: {updated_order.status.value}")
+    else:
+        print("Order canceled successfully")
     print()
-
-    bar_count = 0
-
-    def on_bar(bar):
-        nonlocal bar_count
-        bar_count += 1
-        print(f"[{bar.timestamp}] {bar.symbol}: "
-              f"O={bar.open:.2f} H={bar.high:.2f} L={bar.low:.2f} "
-              f"C={bar.close:.2f} V={bar.volume}")
-
-    market_data.subscribe_bars(["AAPL"], on_bar)
-
-    try:
-        # Run stream (blocking) - press Ctrl+C to stop
-        market_data.run_stream()
-    except KeyboardInterrupt:
-        print(f"\nStopped streaming. Received {bar_count} bars.")
-        market_data.stop_stream()
 
 
 def run_live_trader(args):
@@ -115,6 +136,8 @@ def run_live_trader(args):
         regime_threshold=args.regime_threshold,
         regime_lookback=args.regime_lookback,
         flatten_on_stop=not args.no_flatten_on_stop,
+        enable_gap_filter=args.enable_gap_filter,
+        gap_up_threshold=args.gap_up_threshold,
     )
 
     trader.start()
@@ -122,11 +145,11 @@ def run_live_trader(args):
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Alpaca Trading Bot")
+    parser = argparse.ArgumentParser(description="IB Gateway Trading Bot")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Test command (default behavior)
-    test_parser = subparsers.add_parser("test", help="Test connection to Alpaca")
+    test_parser = subparsers.add_parser("test", help="Test connection to IB Gateway")
 
     # Live trading command
     live_parser = subparsers.add_parser("live", help="Run live trading strategy")
@@ -134,7 +157,7 @@ def main():
         "--ticker", "-t",
         type=str,
         required=True,
-        help="Stock symbol to trade (e.g., DE)"
+        help="Stock symbol to trade (e.g., AAPL)"
     )
     live_parser.add_argument(
         "--lookback",
@@ -187,6 +210,17 @@ def main():
         action="store_true",
         help="Don't flatten position when stop loss triggers"
     )
+    live_parser.add_argument(
+        "--enable-gap-filter",
+        action="store_true",
+        help="Skip trading on days with large gap up"
+    )
+    live_parser.add_argument(
+        "--gap-up-threshold",
+        type=float,
+        default=1.0,
+        help="Skip trading if gap up > this %% (default: 1.0)"
+    )
 
     args = parser.parse_args()
 
@@ -194,11 +228,15 @@ def main():
         run_live_trader(args)
     else:
         # Default: run connection test
-        test_connection()
-        test_market_data()
-        print("=" * 50)
-        print("Connection test complete!")
-        print("=" * 50)
+        if test_connection():
+            test_market_data()
+            test_order()
+            print("=" * 50)
+            print("Connection test complete!")
+            print("=" * 50)
+
+        # Disconnect
+        get_client().disconnect()
 
 
 if __name__ == "__main__":

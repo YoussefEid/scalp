@@ -1,29 +1,24 @@
 """
 Live trading module for the mean reversion scalping strategy.
-Connects the nick-scalp strategy to Alpaca for paper/live trading.
+Connects the nick-scalp strategy to IB Gateway for paper/live trading.
 
 Uses pre-submitted limit orders for low-latency execution:
-1. At market open, submit resting limit orders at bid/ask levels
-2. Monitor for fills via Alpaca's trade updates stream
-3. On fill, cancel opposite order, retreat levels, resubmit
+1. At market open, submit BOTH resting buy and sell limit orders
+2. Monitor for fills via polling
+3. On fill, retreat levels and resubmit the filled side
 """
 import json
 import signal
 import time
-import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict
 import pytz
 
-import pandas as pd
-from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.stream import TradingStream
-
+from data import market_data, TimeFrame
 from config import config, TRADES_DIR
-from trading import trading
-from data import market_data
+from trading import trading, OrderSide
+from client import get_client
 
 # Import strategy from nick-scalp
 from strategy import MeanReversionScalper, Side, Trade
@@ -36,10 +31,10 @@ class LiveTrader:
     """
     Live trading wrapper for the MeanReversionScalper strategy.
 
-    Uses pre-submitted limit orders for low-latency execution:
-    - Resting limit orders sit on the book at calculated levels
-    - When filled, we update strategy state and resubmit at retreated levels
-    - Orders are managed via Alpaca's trade updates WebSocket stream
+    Uses simultaneous buy AND sell limit orders (IB allows this!):
+    - Both orders sit on the book at calculated levels
+    - When one fills, we retreat and resubmit that side
+    - Much simpler than Alpaca's single-order limitation
     """
 
     def __init__(
@@ -54,6 +49,8 @@ class LiveTrader:
         regime_threshold: float = 1.5,
         regime_lookback: int = 5,
         flatten_on_stop: bool = True,
+        enable_gap_filter: bool = False,
+        gap_up_threshold: float = 1.0,
     ):
         """
         Initialize the live trader.
@@ -69,6 +66,8 @@ class LiveTrader:
             regime_threshold: Skip if avg daily range > threshold %
             regime_lookback: Days to look back for regime filter
             flatten_on_stop: Flatten position when stop loss triggers
+            enable_gap_filter: Skip trading on days with large gap up
+            gap_up_threshold: Skip trading if gap up > this % (default: 1.0)
         """
         self.ticker = ticker
         self.lookback = lookback
@@ -80,6 +79,8 @@ class LiveTrader:
         self.regime_threshold = regime_threshold
         self.regime_lookback = regime_lookback
         self.flatten_on_stop = flatten_on_stop
+        self.enable_gap_filter = enable_gap_filter
+        self.gap_up_threshold = gap_up_threshold
 
         self.strategy: Optional[MeanReversionScalper] = None
         self.quote_width_pct: float = 0.0
@@ -89,19 +90,11 @@ class LiveTrader:
         self.bars_processed: int = 0
         self.today_str: str = ""
 
-        # Order tracking
+        # Order tracking - IB allows BOTH orders simultaneously!
         self.active_buy_order_id: Optional[str] = None
         self.active_sell_order_id: Optional[str] = None
         self.active_buy_price: float = 0.0
         self.active_sell_price: float = 0.0
-        self.pending_orders: Dict[str, dict] = {}  # order_id -> order info
-
-        # Trade updates stream
-        self.trade_stream: Optional[TradingStream] = None
-        self.stream_thread: Optional[threading.Thread] = None
-
-        # Lock for thread-safe order management
-        self.order_lock = threading.Lock()
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_shutdown)
@@ -121,24 +114,13 @@ class LiveTrader:
         print(f"[{self._now()}] {msg}")
 
     def _is_market_day(self) -> bool:
-        """Check if today is a market day using Alpaca's calendar."""
-        try:
-            clock = trading._client.get_clock()
-            return clock.is_open or (
-                clock.next_open.date() == datetime.now(ET).date()
-            )
-        except Exception as e:
-            self._log(f"Error checking market day: {e}")
-            return datetime.now(ET).weekday() < 5
+        """Check if today is a market day (simple weekday check)."""
+        return datetime.now(ET).weekday() < 5
 
     def _is_market_open(self) -> bool:
         """Check if market is currently open."""
-        try:
-            clock = trading._client.get_clock()
-            return clock.is_open
-        except:
-            now = datetime.now(ET)
-            return 9 <= now.hour < 16 and now.weekday() < 5
+        now = datetime.now(ET)
+        return 9 <= now.hour < 16 and now.weekday() < 5
 
     def _wait_for_premarket(self):
         """Wait until 9:25 AM ET on a market day."""
@@ -188,7 +170,7 @@ class LiveTrader:
         start = end - timedelta(days=self.lookback + 10)  # Extra days to ensure we get enough data
 
         try:
-            # Use DAILY bars, not 1-minute bars
+            # Use DAILY bars
             bars = market_data.get_bars(
                 self.ticker,
                 timeframe=TimeFrame.Day,
@@ -272,6 +254,62 @@ class LiveTrader:
             self._log(f"Error checking regime filter: {e}")
             return True
 
+    def _check_gap_filter(self, opening_price: float) -> bool:
+        """
+        Check if today passes the gap filter.
+
+        Skip trading if the stock gaps UP more than the threshold percentage
+        from the previous day's close. Gap downs are allowed (mean reversion
+        tends to work better on gap downs).
+
+        Args:
+            opening_price: Today's opening price
+
+        Returns:
+            True if trading allowed (no gap up or gap < threshold), False if gap up exceeds threshold
+        """
+        if not self.enable_gap_filter:
+            return True
+
+        self._log(f"Checking gap filter (threshold: {self.gap_up_threshold}%)...")
+
+        end = datetime.now(ET)
+        start = end - timedelta(days=5)  # Get a few days to ensure we have yesterday's close
+
+        try:
+            bars = market_data.get_bars(
+                self.ticker,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+            )
+
+            if bars.empty or len(bars) < 2:
+                self._log("Not enough daily data for gap filter, allowing trading")
+                return True
+
+            # Get previous day's close (second to last bar)
+            bars_reset = bars.reset_index()
+            prev_close = float(bars_reset.iloc[-2]["close"])
+
+            # Calculate gap percentage (positive = gap up, negative = gap down)
+            gap_pct = (opening_price - prev_close) / prev_close * 100
+
+            self._log(f"Previous close: ${prev_close:.2f}, Opening: ${opening_price:.2f}")
+            self._log(f"Gap: {gap_pct:+.2f}%")
+
+            # Only filter gap UPs, not gap downs
+            if gap_pct > self.gap_up_threshold:
+                self._log(f"Gap filter BLOCKED: gap up {gap_pct:.2f}% > {self.gap_up_threshold}%")
+                return False
+
+            self._log("Gap filter PASSED")
+            return True
+
+        except Exception as e:
+            self._log(f"Error checking gap filter: {e}")
+            return True
+
     def _get_opening_price(self) -> float:
         """Get the opening price for today."""
         self._log("Waiting for opening price...")
@@ -334,267 +372,100 @@ class LiveTrader:
 
     # ==================== Order Management ====================
 
-    def _start_trade_stream(self):
-        """Start the trade updates WebSocket stream."""
-        self._log("Starting trade updates stream...")
+    def _submit_both_orders(self):
+        """Submit BOTH buy and sell limit orders simultaneously.
 
-        self.trade_stream = TradingStream(
-            api_key=config.API_KEY,
-            secret_key=config.API_SECRET,
-            paper=config.PAPER,
-        )
-
-        @self.trade_stream.subscribe_trade_updates
-        async def on_trade_update(data):
-            self._handle_trade_update(data)
-
-        def run_stream():
-            try:
-                self.trade_stream.run()
-            except Exception as e:
-                self._log(f"Trade stream error: {e}")
-
-        self.stream_thread = threading.Thread(target=run_stream, daemon=True)
-        self.stream_thread.start()
-        self._log("Trade updates stream started")
-
-    def _stop_trade_stream(self):
-        """Stop the trade updates stream."""
-        if self.trade_stream:
-            try:
-                self.trade_stream.stop()
-            except:
-                pass
-
-    def _handle_trade_update(self, data):
-        """Handle trade update events from Alpaca."""
-        try:
-            event = data.event
-            order = data.order
-
-            order_id = str(order.id)
-            symbol = order.symbol
-            side = order.side
-            filled_qty = float(order.filled_qty) if order.filled_qty else 0
-            filled_avg_price = float(order.filled_avg_price) if order.filled_avg_price else 0
-
-            # Only process our ticker
-            if symbol != self.ticker:
-                return
-
-            self._log(f"Trade update: {event} | Order {order_id[:8]}... | {side} | Filled: {filled_qty}")
-
-            if event == "fill":
-                self._handle_fill(order_id, side, filled_qty, filled_avg_price)
-            elif event == "partial_fill":
-                self._log(f"Partial fill: {filled_qty} @ ${filled_avg_price:.2f}")
-            elif event in ("canceled", "expired", "rejected"):
-                self._handle_order_closed(order_id, event)
-
-        except Exception as e:
-            self._log(f"Error handling trade update: {e}")
-
-    def _handle_fill(self, order_id: str, side: str, qty: float, price: float):
-        """Handle a filled order."""
-        with self.order_lock:
-            timestamp = datetime.now(ET)
-
-            # Determine which order was filled
-            is_buy = side == "buy"
-
-            self._log(f"FILL: {'BUY' if is_buy else 'SELL'} {int(qty)} @ ${price:.2f}")
-
-            # Update strategy state manually (since we're not using process_bar)
-            if self.strategy:
-                if is_buy:
-                    trade = self.strategy._execute_buy(
-                        timestamp, price, int(qty),
-                        reason=f"Limit order filled @ ${price:.2f}"
-                    )
-                    self.strategy._retreat_after_buy()
-                    self.active_buy_order_id = None
-                else:
-                    trade = self.strategy._execute_sell(
-                        timestamp, price, int(qty),
-                        reason=f"Limit order filled @ ${price:.2f}"
-                    )
-                    self.strategy._retreat_after_sell()
-                    self.active_sell_order_id = None
-
-                # Log the trade
-                self._log_trade_fill(trade, order_id)
-
-                # Check stop loss after trade
-                if self.strategy._check_stop_loss():
-                    self._log("STOP LOSS TRIGGERED!")
-                    self.trading_active = False
-                    self._cancel_all_orders()
-
-                    if self.flatten_on_stop and self.strategy.state.position != 0:
-                        self._flatten_position_market()
-                    return
-
-                # Cancel the opposite order and resubmit both at new levels
-                self._cancel_opposite_order(is_buy)
-                self._submit_resting_orders()
-
-    def _handle_order_closed(self, order_id: str, reason: str):
-        """Handle canceled/expired/rejected order."""
-        with self.order_lock:
-            if order_id == self.active_buy_order_id:
-                self.active_buy_order_id = None
-                self._log(f"Buy order {reason}")
-            elif order_id == self.active_sell_order_id:
-                self.active_sell_order_id = None
-                self._log(f"Sell order {reason}")
-
-    def _cancel_opposite_order(self, filled_was_buy: bool):
-        """Cancel the order on the opposite side after a fill."""
-        try:
-            if filled_was_buy and self.active_sell_order_id:
-                trading.cancel_order(self.active_sell_order_id)
-                self._log(f"Canceled sell order {self.active_sell_order_id[:8]}...")
-                self.active_sell_order_id = None
-            elif not filled_was_buy and self.active_buy_order_id:
-                trading.cancel_order(self.active_buy_order_id)
-                self._log(f"Canceled buy order {self.active_buy_order_id[:8]}...")
-                self.active_buy_order_id = None
-        except Exception as e:
-            self._log(f"Error canceling opposite order: {e}")
-
-    def _cancel_all_orders(self):
-        """Cancel all active orders."""
-        with self.order_lock:
-            try:
-                if self.active_buy_order_id:
-                    trading.cancel_order(self.active_buy_order_id)
-                    self._log(f"Canceled buy order")
-                    self.active_buy_order_id = None
-            except Exception as e:
-                self._log(f"Error canceling buy order: {e}")
-
-            try:
-                if self.active_sell_order_id:
-                    trading.cancel_order(self.active_sell_order_id)
-                    self._log(f"Canceled sell order")
-                    self.active_sell_order_id = None
-            except Exception as e:
-                self._log(f"Error canceling sell order: {e}")
-
-    def _check_and_execute(self):
-        """Manage limit orders with quick switching based on price direction.
-
-        Strategy:
-        1. Only one limit order active at a time (Alpaca restriction)
-        2. Track price direction - if price moves toward opposite level, switch sides
-        3. Submit the side that price is moving TOWARD (likely to fill)
-        4. Quick cancel and switch when price reverses direction
+        This is the key advantage of IB over Alpaca - we can have both
+        sides resting on the book at the same time!
         """
+        if not self.trading_active or not self.strategy:
+            return
+
+        bid, ask = self.strategy.state.get_quotes()
+        bid_price = round(bid.price, 2)
+        ask_price = round(ask.price, 2)
+
+        # Submit buy if not active
+        if not self.active_buy_order_id:
+            self._submit_limit_buy(bid_price)
+
+        # Submit sell if not active
+        if not self.active_sell_order_id:
+            self._submit_limit_sell(ask_price)
+
+    def _check_and_update_orders(self):
+        """Check for fills and update order prices if levels changed."""
         if not self.trading_active or not self.strategy:
             return
 
         # Check market hours
         now = datetime.now(ET)
         if now.hour == 15 and now.minute >= 55:
-            self._log("Near market close, stopping execution")
+            self._log("Near market close, stopping new orders")
             return
         if now.hour >= 16:
             return
 
-        with self.order_lock:
-            bid, ask = self.strategy.state.get_quotes()
+        # Get current strategy levels
+        bid, ask = self.strategy.state.get_quotes()
+        bid_price = round(bid.price, 2)
+        ask_price = round(ask.price, 2)
 
-            # Round prices to 2 decimal places
-            bid_price = round(bid.price, 2)
-            ask_price = round(ask.price, 2)
+        # Check buy order
+        if self.active_buy_order_id:
+            self._check_buy_order(bid_price)
 
-            # Get current market price
-            try:
-                quote = market_data.get_latest_quote(self.ticker)
-                current_bid = float(quote.bid_price)
-                current_ask = float(quote.ask_price)
-                current_mid = (current_bid + current_ask) / 2
-            except Exception as e:
-                self._log(f"Error getting quote: {e}")
-                return
+        # Check sell order
+        if self.active_sell_order_id:
+            self._check_sell_order(ask_price)
 
-            # Track price direction
-            if not hasattr(self, '_last_mid_price'):
-                self._last_mid_price = current_mid
+        # Resubmit any missing orders
+        self._submit_both_orders()
 
-            price_moving_down = current_mid < self._last_mid_price
-            price_moving_up = current_mid > self._last_mid_price
-            self._last_mid_price = current_mid
-
-            # Determine which side SHOULD have the order based on price direction
-            # If price moving down -> submit BUY (price approaching bid level)
-            # If price moving up -> submit SELL (price approaching ask level)
-            # If price stable -> use distance to determine
-
-            dist_to_bid = current_mid - bid_price
-            dist_to_ask = ask_price - current_mid
-
-            if price_moving_down:
-                desired_side = "buy"
-            elif price_moving_up:
-                desired_side = "sell"
-            else:
-                # Price stable - pick closer side
-                desired_side = "buy" if dist_to_bid <= dist_to_ask else "sell"
-
-            # Check active orders and switch if needed
-            if self.active_buy_order_id:
-                # Check for fill first
-                filled = self._check_buy_order_fill(bid_price)
-                if filled:
-                    return
-
-                # If we should be on sell side and price moved significantly, switch
-                if desired_side == "sell" and price_moving_up:
-                    self._cancel_and_switch_to_sell(ask_price)
-
-            elif self.active_sell_order_id:
-                # Check for fill first
-                filled = self._check_sell_order_fill(ask_price)
-                if filled:
-                    return
-
-                # If we should be on buy side and price moved significantly, switch
-                if desired_side == "buy" and price_moving_down:
-                    self._cancel_and_switch_to_buy(bid_price)
-
-            else:
-                # No active order - submit based on desired side
-                if desired_side == "buy":
-                    self._submit_limit_buy(bid_price)
-                else:
-                    self._submit_limit_sell(ask_price)
-
-    def _check_buy_order_fill(self, current_bid_level: float) -> bool:
-        """Check if buy order filled. Returns True if filled."""
+    def _check_buy_order(self, current_bid_level: float):
+        """Check buy order status and handle fills/updates."""
         try:
             order = trading.get_order(self.active_buy_order_id)
+            if not order:
+                self.active_buy_order_id = None
+                self.active_buy_price = 0.0
+                return
 
-            if order.status.value == "filled":
-                fill_price = float(order.filled_avg_price)
-                self._log(f"BUY FILLED @ ${fill_price:.2f}")
+            status = order.status.value
+            filled_qty = order.filled_qty
+            total_qty = order.qty
+
+            # Check for partial fill (filled_qty > 0 but status not "filled")
+            if filled_qty > 0 and status != "filled":
+                self._log(f"⚠️ PARTIAL FILL detected on BUY: {filled_qty}/{total_qty} shares @ ${order.filled_avg_price:.2f}")
+                self._log(f"   Order status: {status}, remaining: {total_qty - filled_qty} shares")
+
+            if status == "filled":
+                fill_price = float(order.filled_avg_price) if order.filled_avg_price else current_bid_level
+                self._log(f"BUY FILLED @ ${fill_price:.2f} ({filled_qty} shares)")
                 self._handle_buy_fill(fill_price)
                 self.active_buy_order_id = None
                 self.active_buy_price = 0.0
-                return True
+                return
 
-            elif order.status.value in ["canceled", "expired", "rejected"]:
-                self._log(f"Buy order {order.status.value}")
+            if status in ["canceled", "expired", "rejected"]:
+                # Log if there was a partial fill before cancel
+                if filled_qty > 0:
+                    self._log(f"⚠️ Buy order {status} with PARTIAL FILL: {filled_qty}/{total_qty} shares @ ${order.filled_avg_price:.2f}")
+                else:
+                    self._log(f"Buy order {status}")
                 self.active_buy_order_id = None
                 self.active_buy_price = 0.0
+                return
 
-            # Update price if level changed
-            elif abs(current_bid_level - self.active_buy_price) > 0.01:
+            # Update price if level changed significantly
+            if abs(current_bid_level - self.active_buy_price) > 0.01:
+                # Warn if canceling an order with partial fills
+                if filled_qty > 0:
+                    self._log(f"⚠️ Canceling buy order with PARTIAL FILL: {filled_qty}/{total_qty} shares already filled")
                 self._log(f"Updating buy: ${self.active_buy_price:.2f} -> ${current_bid_level:.2f}")
-                try:
-                    trading.cancel_order(self.active_buy_order_id)
-                except Exception:
-                    pass
+                trading.cancel_order(self.active_buy_order_id)
+                get_client().sleep(0.2)  # Wait for cancel
                 self.active_buy_order_id = None
                 self.active_buy_price = 0.0
                 self._submit_limit_buy(current_bid_level)
@@ -604,33 +475,50 @@ class LiveTrader:
             self.active_buy_order_id = None
             self.active_buy_price = 0.0
 
-        return False
-
-    def _check_sell_order_fill(self, current_ask_level: float) -> bool:
-        """Check if sell order filled. Returns True if filled."""
+    def _check_sell_order(self, current_ask_level: float):
+        """Check sell order status and handle fills/updates."""
         try:
             order = trading.get_order(self.active_sell_order_id)
+            if not order:
+                self.active_sell_order_id = None
+                self.active_sell_price = 0.0
+                return
 
-            if order.status.value == "filled":
-                fill_price = float(order.filled_avg_price)
-                self._log(f"SELL FILLED @ ${fill_price:.2f}")
+            status = order.status.value
+            filled_qty = order.filled_qty
+            total_qty = order.qty
+
+            # Check for partial fill (filled_qty > 0 but status not "filled")
+            if filled_qty > 0 and status != "filled":
+                self._log(f"⚠️ PARTIAL FILL detected on SELL: {filled_qty}/{total_qty} shares @ ${order.filled_avg_price:.2f}")
+                self._log(f"   Order status: {status}, remaining: {total_qty - filled_qty} shares")
+
+            if status == "filled":
+                fill_price = float(order.filled_avg_price) if order.filled_avg_price else current_ask_level
+                self._log(f"SELL FILLED @ ${fill_price:.2f} ({filled_qty} shares)")
                 self._handle_sell_fill(fill_price)
                 self.active_sell_order_id = None
                 self.active_sell_price = 0.0
-                return True
+                return
 
-            elif order.status.value in ["canceled", "expired", "rejected"]:
-                self._log(f"Sell order {order.status.value}")
+            if status in ["canceled", "expired", "rejected"]:
+                # Log if there was a partial fill before cancel
+                if filled_qty > 0:
+                    self._log(f"⚠️ Sell order {status} with PARTIAL FILL: {filled_qty}/{total_qty} shares @ ${order.filled_avg_price:.2f}")
+                else:
+                    self._log(f"Sell order {status}")
                 self.active_sell_order_id = None
                 self.active_sell_price = 0.0
+                return
 
-            # Update price if level changed
-            elif abs(current_ask_level - self.active_sell_price) > 0.01:
+            # Update price if level changed significantly
+            if abs(current_ask_level - self.active_sell_price) > 0.01:
+                # Warn if canceling an order with partial fills
+                if filled_qty > 0:
+                    self._log(f"⚠️ Canceling sell order with PARTIAL FILL: {filled_qty}/{total_qty} shares already filled")
                 self._log(f"Updating sell: ${self.active_sell_price:.2f} -> ${current_ask_level:.2f}")
-                try:
-                    trading.cancel_order(self.active_sell_order_id)
-                except Exception:
-                    pass
+                trading.cancel_order(self.active_sell_order_id)
+                get_client().sleep(0.2)  # Wait for cancel
                 self.active_sell_order_id = None
                 self.active_sell_price = 0.0
                 self._submit_limit_sell(current_ask_level)
@@ -639,88 +527,6 @@ class LiveTrader:
             self._log(f"Error checking sell order: {e}")
             self.active_sell_order_id = None
             self.active_sell_price = 0.0
-
-        return False
-
-    def _cancel_and_switch_to_sell(self, ask_price: float):
-        """Cancel buy order and switch to sell side."""
-        order_id = self.active_buy_order_id
-        self.active_buy_order_id = None
-        self.active_buy_price = 0.0
-
-        try:
-            trading.cancel_order(order_id)
-            self._log("Switching: canceling buy...")
-
-            # Wait for cancel to complete (poll up to 3 seconds)
-            canceled = False
-            for _ in range(30):
-                time.sleep(0.1)
-                try:
-                    order = trading.get_order(order_id)
-                    status = order.status.value
-                    if status in ["canceled", "expired"]:
-                        canceled = True
-                        break
-                    elif status == "filled":
-                        # Order filled while we were canceling - handle the fill
-                        self._log("Buy filled during cancel!")
-                        fill_price = float(order.filled_avg_price)
-                        self._handle_buy_fill(fill_price)
-                        return  # Don't switch, we just got filled
-                except Exception:
-                    canceled = True  # Order may not exist anymore
-                    break
-
-            if canceled:
-                self._log("Buy canceled, submitting sell")
-                self._submit_limit_sell(ask_price)
-            else:
-                self._log("Warning: Cancel may not have completed")
-                # Don't submit sell - wait for next iteration
-
-        except Exception as e:
-            self._log(f"Error canceling buy: {e}")
-
-    def _cancel_and_switch_to_buy(self, bid_price: float):
-        """Cancel sell order and switch to buy side."""
-        order_id = self.active_sell_order_id
-        self.active_sell_order_id = None
-        self.active_sell_price = 0.0
-
-        try:
-            trading.cancel_order(order_id)
-            self._log("Switching: canceling sell...")
-
-            # Wait for cancel to complete (poll up to 3 seconds)
-            canceled = False
-            for _ in range(30):
-                time.sleep(0.1)
-                try:
-                    order = trading.get_order(order_id)
-                    status = order.status.value
-                    if status in ["canceled", "expired"]:
-                        canceled = True
-                        break
-                    elif status == "filled":
-                        # Order filled while we were canceling - handle the fill
-                        self._log("Sell filled during cancel!")
-                        fill_price = float(order.filled_avg_price)
-                        self._handle_sell_fill(fill_price)
-                        return  # Don't switch, we just got filled
-                except Exception:
-                    canceled = True  # Order may not exist anymore
-                    break
-
-            if canceled:
-                self._log("Sell canceled, submitting buy")
-                self._submit_limit_buy(bid_price)
-            else:
-                self._log("Warning: Cancel may not have completed")
-                # Don't submit buy - wait for next iteration
-
-        except Exception as e:
-            self._log(f"Error canceling sell: {e}")
 
     def _submit_limit_buy(self, price: float):
         """Submit a limit buy order."""
@@ -754,14 +560,28 @@ class LiveTrader:
             reason=f"Limit order filled @ ${fill_price:.2f}"
         )
         self.strategy._retreat_after_buy()
-        self._log_trade_fill(trade, self.active_buy_order_id)
+        self._log_trade_fill(trade, self.active_buy_order_id or "unknown")
 
         # Check stop loss
         if self.strategy._check_stop_loss():
             self._log("STOP LOSS TRIGGERED!")
             self.trading_active = False
+            self._cancel_all_orders()
             if self.flatten_on_stop and self.strategy.state.position != 0:
                 self._flatten_position_market()
+            return
+
+        # After retreat, BOTH quote levels changed - cancel and resubmit the sell order
+        # The buy order is already filled, so we just need to update the sell
+        if self.active_sell_order_id:
+            self._log("Retreat: canceling sell to resubmit at new level")
+            try:
+                trading.cancel_order(self.active_sell_order_id)
+                get_client().sleep(0.2)
+            except Exception as e:
+                self._log(f"Error canceling sell for retreat: {e}")
+            self.active_sell_order_id = None
+            self.active_sell_price = 0.0
 
     def _handle_sell_fill(self, fill_price: float):
         """Handle a filled sell order."""
@@ -771,14 +591,46 @@ class LiveTrader:
             reason=f"Limit order filled @ ${fill_price:.2f}"
         )
         self.strategy._retreat_after_sell()
-        self._log_trade_fill(trade, self.active_sell_order_id)
+        self._log_trade_fill(trade, self.active_sell_order_id or "unknown")
 
         # Check stop loss
         if self.strategy._check_stop_loss():
             self._log("STOP LOSS TRIGGERED!")
             self.trading_active = False
+            self._cancel_all_orders()
             if self.flatten_on_stop and self.strategy.state.position != 0:
                 self._flatten_position_market()
+            return
+
+        # After retreat, BOTH quote levels changed - cancel and resubmit the buy order
+        # The sell order is already filled, so we just need to update the buy
+        if self.active_buy_order_id:
+            self._log("Retreat: canceling buy to resubmit at new level")
+            try:
+                trading.cancel_order(self.active_buy_order_id)
+                get_client().sleep(0.2)
+            except Exception as e:
+                self._log(f"Error canceling buy for retreat: {e}")
+            self.active_buy_order_id = None
+            self.active_buy_price = 0.0
+
+    def _cancel_all_orders(self):
+        """Cancel all active orders."""
+        try:
+            if self.active_buy_order_id:
+                trading.cancel_order(self.active_buy_order_id)
+                self._log("Canceled buy order")
+                self.active_buy_order_id = None
+        except Exception as e:
+            self._log(f"Error canceling buy order: {e}")
+
+        try:
+            if self.active_sell_order_id:
+                trading.cancel_order(self.active_sell_order_id)
+                self._log("Canceled sell order")
+                self.active_sell_order_id = None
+        except Exception as e:
+            self._log(f"Error canceling sell order: {e}")
 
     def _flatten_position_market(self):
         """Flatten position using market order."""
@@ -841,7 +693,8 @@ class LiveTrader:
             summary = self.strategy.get_summary(final_price)
             summary["ticker"] = self.ticker
             summary["date"] = self.today_str
-            summary["execution_mode"] = "limit_orders"
+            summary["execution_mode"] = "simultaneous_limit_orders"
+            summary["broker"] = "IB_Gateway"
 
             summary_file = TRADES_DIR / f"{self.today_str}_{self.ticker}_summary.json"
             with open(summary_file, "w") as f:
@@ -858,8 +711,14 @@ class LiveTrader:
         """Start the live trading session."""
         self._log("=" * 50)
         self._log(f"Starting Live Trader for {self.ticker}")
-        self._log("Execution mode: LIMIT orders (one at a time)")
+        self._log("Execution mode: SIMULTANEOUS limit orders (IB Gateway)")
         self._log("=" * 50)
+
+        # Connect to IB Gateway
+        client = get_client()
+        if not client.connect():
+            self._log("Failed to connect to IB Gateway. Exiting.")
+            return
 
         config.print_mode()
 
@@ -882,12 +741,22 @@ class LiveTrader:
 
                 self.quote_width_pct = self._calculate_quote_width()
                 self.zero_point = self._get_opening_price()
+
+                # Check gap filter (needs opening price)
+                if not self._check_gap_filter(self.zero_point):
+                    self._log("Skipping today due to gap filter")
+                    self._wait_for_market_close()
+                    continue
+
                 self._init_strategy()
 
                 # Start trading
                 self.trading_active = True
 
-                # Main loop: monitor price and execute
+                # Submit initial orders on both sides
+                self._submit_both_orders()
+
+                # Main loop: monitor and update orders
                 self._run_trading_loop()
 
                 # End of day
@@ -898,7 +767,7 @@ class LiveTrader:
                 time.sleep(60)
 
     def _run_trading_loop(self):
-        """Main trading loop - monitors price and executes market orders."""
+        """Main trading loop - monitors orders and updates them."""
         last_status_log = time.time()
         status_interval = 60  # Log status every minute
 
@@ -911,12 +780,12 @@ class LiveTrader:
                     self._log_status()
                     last_status_log = now
 
-                # Check price and execute if levels are hit
+                # Check and update orders
                 if self.trading_active:
-                    self._check_and_execute()
+                    self._check_and_update_orders()
 
-                # Poll every 100ms for faster response
-                time.sleep(0.1)
+                # Allow IB message processing
+                get_client().sleep(0.1)
 
             except Exception as e:
                 self._log(f"Error in trading loop: {e}")
@@ -960,9 +829,6 @@ class LiveTrader:
         # Cancel any remaining orders
         self._cancel_all_orders()
 
-        # Stop trade stream
-        self._stop_trade_stream()
-
         if self.strategy:
             try:
                 quote = market_data.get_latest_quote(self.ticker)
@@ -989,5 +855,7 @@ class LiveTrader:
         self.trading_active = False
 
         self._cancel_all_orders()
-        self._stop_trade_stream()
         self._end_of_day()
+
+        # Disconnect from IB
+        get_client().disconnect()
