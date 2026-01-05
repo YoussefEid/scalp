@@ -739,8 +739,11 @@ class LiveTrader:
                     self._wait_for_market_close()
                     continue
 
-                self.quote_width_pct = self._calculate_quote_width()
+                # Get opening price first (waits until 9:30 AM)
                 self.zero_point = self._get_opening_price()
+
+                # Calculate quote width after market open (IB data more reliable)
+                self.quote_width_pct = self._calculate_quote_width()
 
                 # Check gap filter (needs opening price)
                 if not self._check_gap_filter(self.zero_point):
